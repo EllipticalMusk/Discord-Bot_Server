@@ -1,190 +1,141 @@
 import discord
+from discord.ext import commands
 import os
 import asyncio
 import yt_dlp
-import json
 from dotenv import load_dotenv
+import urllib.parse, urllib.request, re
 
-def run_bot():
-    # Load configuration
-    load_dotenv()
-    TOKEN = os.getenv("Token")
-    CONFIG_FILE = "config.json"
+load_dotenv()
+TOKEN = os.getenv('Token')
+Pre = os.getenv('Prefix')
 
-    # Load or initialize config
-    if os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE, "r") as f:
-            config = json.load(f)
+intents = discord.Intents.default()
+intents.message_content = True
+client = commands.Bot(command_prefix=Pre, intents=intents)
+
+queues = {}
+voice_clients = {}
+youtube_base_url = 'https://www.youtube.com/'
+youtube_results_url = youtube_base_url + 'results?'
+youtube_watch_url = youtube_base_url + 'watch?v='
+yt_dl_options = {"format": "bestaudio/best"}
+ytdl = yt_dlp.YoutubeDL(yt_dl_options)
+
+ffmpeg_options = {'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
+                  'options': '-vn -filter:a "volume=0.25"'}
+
+ALLOWED_CHANNEL_ID = int(os.getenv('AllowedChannelID'))
+
+@client.event
+async def on_ready():
+    print(f'{client.user} is now jamming!')
+
+async def play_next(ctx):
+    if queues[ctx.guild.id]:
+        link = queues[ctx.guild.id].pop(0)
+        await play(ctx, link=link)
+
+@client.command(name="play")
+async def play(ctx, *, link):
+    if ctx.channel.id != ALLOWED_CHANNEL_ID:
+        await ctx.send("You can only use commands in the designated channel.")
+        return
+
+    try:
+        if ctx.author.voice is None:
+            await ctx.send("You need to be in a voice channel to use this command.")
+            return
+
+        if ctx.guild.id not in voice_clients or voice_clients[ctx.guild.id].is_connected() == False:
+            voice_client = await ctx.author.voice.channel.connect()
+            voice_clients[ctx.guild.id] = voice_client
+
+        if youtube_base_url not in link:
+            query_string = urllib.parse.urlencode({'search_query': link})
+            content = urllib.request.urlopen(youtube_results_url + query_string)
+            search_results = re.findall(r'/watch\?v=(.{11})', content.read().decode())
+            link = youtube_watch_url + search_results[0]
+
+        loop = asyncio.get_event_loop()
+        data = await loop.run_in_executor(None, lambda: ytdl.extract_info(link, download=False))
+
+        song = data['url']
+        title = data['title']
+        duration = data.get('duration', 0)
+        thumbnail = data.get('thumbnail', '')
+
+        embed = discord.Embed(title="Now Playing", description=f"[{title}]({link})", color=discord.Color.green())
+        embed.add_field(name="Requested by", value=ctx.author.mention)
+        embed.add_field(name="Duration", value=f"{duration // 60}:{duration % 60:02}")
+        embed.set_thumbnail(url=thumbnail)
+
+        await ctx.send(embed=embed)
+
+        player = discord.FFmpegOpusAudio(song, **ffmpeg_options)
+        voice_clients[ctx.guild.id].play(player, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(ctx), client.loop))
+    except yt_dlp.utils.DownloadError:
+        await ctx.send("An error occurred while trying to process the YouTube link. Please try a different link.")
+    except Exception as e:
+        print(e)
+        await ctx.send("An unexpected error occurred. Please try again later.")
+
+@client.command(name="skip")
+async def skip(ctx):
+    if ctx.channel.id != ALLOWED_CHANNEL_ID:
+        await ctx.send("You can only use commands in the designated channel.")
+        return
+
+    try:
+        if ctx.guild.id in voice_clients and voice_clients[ctx.guild.id].is_playing():
+            voice_clients[ctx.guild.id].stop()
+            await ctx.send(embed=discord.Embed(description="Skipped the current song!", color=discord.Color.orange()))
+        else:
+            await ctx.send(embed=discord.Embed(description="There is no song playing to skip.", color=discord.Color.red()))
+    except Exception as e:
+        print(e)
+        await ctx.send("An error occurred while trying to skip the song.")
+
+@client.command(name="stop")
+async def stop(ctx):
+    if ctx.channel.id != ALLOWED_CHANNEL_ID:
+        await ctx.send("You can only use commands in the designated channel.")
+        return
+
+    try:
+        if ctx.guild.id in voice_clients:
+            await voice_clients[ctx.guild.id].disconnect()
+            del voice_clients[ctx.guild.id]
+            if ctx.guild.id in queues:
+                queues[ctx.guild.id].clear()
+            await ctx.send(embed=discord.Embed(description="Stopped playback and disconnected!", color=discord.Color.red()))
+        else:
+            await ctx.send(embed=discord.Embed(description="The bot is not connected to a voice channel.", color=discord.Color.red()))
+    except Exception as e:
+        print(e)
+        await ctx.send("An error occurred while trying to stop the playback.")
+
+@client.command(name="clear_queue")
+async def clear_queue(ctx):
+    if ctx.channel.id != ALLOWED_CHANNEL_ID:
+        await ctx.send("You can only use commands in the designated channel.")
+        return
+
+    if ctx.guild.id in queues:
+        queues[ctx.guild.id].clear()
+        await ctx.send(embed=discord.Embed(description="Queue cleared!", color=discord.Color.red()))
     else:
-        config = {"prefix": "?", "channel_id": None}
-        with open(CONFIG_FILE, "w") as f:
-            json.dump(config, f)
+        await ctx.send(embed=discord.Embed(description="There is no queue to clear.", color=discord.Color.red()))
 
-    prefix = config.get("prefix", "?")
-    allowed_channel_id = config.get("channel_id")
+@client.command(name="queue")
+async def queue(ctx, *, url):
+    if ctx.channel.id != ALLOWED_CHANNEL_ID:
+        await ctx.send("You can only use commands in the designated channel.")
+        return
 
-    intents = discord.Intents.default()
-    intents.message_content = True
-    client = discord.Client(intents=intents)
+    if ctx.guild.id not in queues:
+        queues[ctx.guild.id] = []
+    queues[ctx.guild.id].append(url)
+    await ctx.send(embed=discord.Embed(description="Added to queue!", color=discord.Color.blue()))
 
-    queues = {}
-    voice_clients = {}
-    yt_dl_options = {"format": "bestaudio/best"}
-    ytdl = yt_dlp.YoutubeDL(yt_dl_options)
-
-    ffmpeg_options = {
-        "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-        "options": '-vn -filter:a "volume=0.25"',
-    }
-
-    async def play_next_song(guild_id):
-        """Play the next song in the queue."""
-        
-        if guild_id in queues and queues[guild_id]:
-            song_data = queues[guild_id].pop(0)
-            song_url = song_data["url"]
-            voice_client = voice_clients[guild_id]
-            player = discord.FFmpegOpusAudio(song_url, **ffmpeg_options)
-
-            # Play the next song and send the "Now Playing" embed
-            voice_client.play(player, after=lambda e: asyncio.run_coroutine_threadsafe(play_next_song(guild_id), asyncio.get_event_loop()))
-            
-            embed = discord.Embed(
-                title="Now Playing",
-                description=f"**{song_data['title']}**",
-                color=discord.Color.green(),
-            )
-            embed.add_field(name="Uploader", value=song_data.get("uploader", "Unknown"), inline=True)
-            embed.add_field(name="Requested by", value=song_data["requester"], inline=True)
-            embed.set_thumbnail(url=song_data["thumbnail"])
-            await song_data["channel"].send(embed=embed)
-
-    @client.event
-    async def on_ready():
-        print(f"{client.user} is online and ready!")
-
-    @client.event
-    async def on_message(message):
-        nonlocal prefix, allowed_channel_id
-
-        # Ignore messages from the bot itself
-        if message.author == client.user:
-            return
-
-        # Restrict to specific channel if set
-        if allowed_channel_id and message.channel.id != allowed_channel_id:
-            return
-
-        if message.content.startswith(f"{prefix}setprefix"):
-            try:
-                new_prefix = message.content.split()[1]
-                prefix = new_prefix
-                config["prefix"] = new_prefix
-                with open(CONFIG_FILE, "w") as f:
-                    json.dump(config, f)
-                await message.channel.send(f"Prefix updated to `{new_prefix}`")
-            except IndexError:
-                await message.channel.send("Usage: setprefix <new_prefix>")
-
-        if message.content.startswith(f"{prefix}setchannel"):
-            try:
-                allowed_channel_id = message.channel.id
-                config["channel_id"] = allowed_channel_id
-                with open(CONFIG_FILE, "w") as f:
-                    json.dump(config, f)
-                await message.channel.send(f"Commands restricted to this channel.")
-            except Exception as e:
-                await message.channel.send("Failed to set the allowed channel.")
-                print(e)
-
-        if message.content.startswith(f"{prefix}play"):
-            try:
-                # Connect to the voice channel
-                if message.guild.id not in voice_clients or not voice_clients[message.guild.id].is_connected():
-                    voice_client = await message.author.voice.channel.connect()
-                    voice_clients[message.guild.id] = voice_client
-                else:
-                    voice_client = voice_clients[message.guild.id]
-
-                # Extract the search query or URL
-                query = " ".join(message.content.split()[1:])
-                loop = asyncio.get_event_loop()
-
-                # Determine if it's a search or URL
-                if "http://" in query or "https://" in query:
-                    data = await loop.run_in_executor(None, lambda: ytdl.extract_info(query, download=False))
-                else:
-                    # Perform a YouTube search
-                    data = await loop.run_in_executor(
-                        None, lambda: ytdl.extract_info(f"ytsearch:{query}", download=False)["entries"][0]
-                    )
-
-                # Extract song details
-                song = {
-                    "url": data["url"],
-                    "title": data["title"],
-                    "uploader": data.get("uploader", "Unknown"),
-                    "thumbnail": data["thumbnail"],
-                    "requester": message.author.mention,
-                    "channel": message.channel,
-                }
-
-                # Add to queue
-                if message.guild.id not in queues:
-                    queues[message.guild.id] = []
-
-                is_playing = voice_client.is_playing()
-                queues[message.guild.id].append(song)
-
-                # Send "Added to Queue" embed
-                embed = discord.Embed(
-                    title="Added to Queue",
-                    description=f"**{song['title']}**",
-                    color=discord.Color.blue(),
-                )
-                embed.add_field(name="Uploader", value=song.get("uploader", "Unknown"), inline=True)
-                embed.add_field(name="Added by", value=song["requester"], inline=True)
-                embed.set_thumbnail(url=song["thumbnail"])
-                await message.channel.send(embed=embed)
-
-                # Play if nothing is currently playing
-                if not is_playing:
-                    await play_next_song(message.guild.id)
-
-            except Exception as e:
-                print(e)
-                await message.channel.send("An error occurred while trying to play the song.")
-
-        if message.content.startswith(f"{prefix}pause"):
-            try:
-                voice_clients[message.guild.id].pause()
-                await message.channel.send("Playback paused.")
-            except Exception as e:
-                print(e)
-
-        if message.content.startswith(f"{prefix}resume"):
-            try:
-                voice_clients[message.guild.id].resume()
-                await message.channel.send("Playback resumed.")
-            except Exception as e:
-                print(e)
-
-        if message.content.startswith(f"{prefix}stop"):
-            try:
-                voice_clients[message.guild.id].stop()
-                queues[message.guild.id] = []
-                await voice_clients[message.guild.id].disconnect()
-                await message.channel.send("Playback stopped and disconnected.")
-            except Exception as e:
-                print(e)
-
-        if message.content.startswith(f"{prefix}skip"):
-            try:
-                voice_clients[message.guild.id].stop()
-                await message.channel.send("Song skipped.")
-                await play_next_song(message.guild.id)
-            except Exception as e:
-                print(e)
-                await message.channel.send("An error occurred while trying to skip the song.")
-
-    client.run(TOKEN)
+client.run(TOKEN)
