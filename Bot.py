@@ -47,16 +47,19 @@ async def play(ctx, *, link):
             await ctx.send("You need to be in a voice channel to use this command.")
             return
 
+        # Check if the bot is connected, if not, connect to the channel
         if ctx.guild.id not in voice_clients or voice_clients[ctx.guild.id].is_connected() == False:
             voice_client = await ctx.author.voice.channel.connect()
             voice_clients[ctx.guild.id] = voice_client
 
+        # If the link is not a YouTube link, search for it
         if youtube_base_url not in link:
             query_string = urllib.parse.urlencode({'search_query': link})
             content = urllib.request.urlopen(youtube_results_url + query_string)
             search_results = re.findall(r'/watch\?v=(.{11})', content.read().decode())
             link = youtube_watch_url + search_results[0]
 
+        # Extract the song info from YouTube
         loop = asyncio.get_event_loop()
         data = await loop.run_in_executor(None, lambda: ytdl.extract_info(link, download=False))
 
@@ -70,16 +73,25 @@ async def play(ctx, *, link):
         embed.add_field(name="Duration", value=f"{duration // 60}:{duration % 60:02}")
         embed.set_thumbnail(url=thumbnail)
 
-        await ctx.send(embed=embed)
+        # If there's already a song playing, add the new song to the queue
+        if ctx.guild.id in queues and voice_clients[ctx.guild.id].is_playing():
+            queues[ctx.guild.id].append(link)
+            await ctx.send(embed=discord.Embed(description=f"Added {title} to the queue!", color=discord.Color.blue()))
+        else:
+            # No song playing, play the song immediately
+            await ctx.send(embed=embed)
+            player = discord.FFmpegOpusAudio(song, **ffmpeg_options)
+            voice_clients[ctx.guild.id].play(player, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(ctx), client.loop))
 
-        player = discord.FFmpegOpusAudio(song, **ffmpeg_options)
-        voice_clients[ctx.guild.id].play(player, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(ctx), client.loop))
-    except yt_dlp.utils.DownloadError:
-        await ctx.send("An error occurred while trying to process the YouTube link. Please try a different link.")
+            # Initialize the queue if it doesn't exist
+            if ctx.guild.id not in queues:
+                queues[ctx.guild.id] = []
+            # Add the song to the queue for the next play
+            queues[ctx.guild.id].append(link)
+
     except Exception as e:
         print(e)
-        await ctx.send("An unexpected error occurred. Please try again later.")
-
+        await ctx.send("An error occurred while trying to process the YouTube link. Please try a different link.")
 @client.command(name="skip")
 async def skip(ctx):
     if ctx.channel.id != ALLOWED_CHANNEL_ID:
@@ -127,7 +139,7 @@ async def clear_queue(ctx):
     else:
         await ctx.send(embed=discord.Embed(description="There is no queue to clear.", color=discord.Color.red()))
 
-@client.command(name="queue")
+@client.command(name="p")
 async def queue(ctx, *, url):
     if ctx.channel.id != ALLOWED_CHANNEL_ID:
         await ctx.send("You can only use commands in the designated channel.")
@@ -137,5 +149,44 @@ async def queue(ctx, *, url):
         queues[ctx.guild.id] = []
     queues[ctx.guild.id].append(url)
     await ctx.send(embed=discord.Embed(description="Added to queue!", color=discord.Color.blue()))
+
+@client.command(name="join")
+async def join(ctx):
+    if ctx.channel.id != ALLOWED_CHANNEL_ID:
+        await ctx.send("You can only use commands in the designated channel.")
+        return
+
+    try:
+        song_query = "bbno$ Edamame"  # Song you want to play
+        # Search the song on YouTube
+        query_string = urllib.parse.urlencode({'search_query': song_query})
+        content = urllib.request.urlopen(youtube_results_url + query_string)
+        search_results = re.findall(r'/watch\?v=(.{11})', content.read().decode())
+        if search_results:
+            link = youtube_watch_url + search_results[0]
+            await play(ctx, link=link)  # Play the song using the existing play function
+        else:
+            await ctx.send("Could not find the song. Please try again.")
+    except Exception as e:
+        print(e)
+        await ctx.send("An error occurred while trying to play the song.")
+
+
+@client.event
+async def on_disconnect():
+    print("Bot disconnected. Attempting to reconnect...")
+    try:
+        await client.close()  # Optionally close the bot before reconnecting
+        client.run(TOKEN)  # Re-run the bot to reconnect
+    except Exception as e:
+        print(f"Error during reconnect: {e}")
+
+
+@client.event
+async def on_resumed():
+    print("Bot reconnected and resumed.")
+
+
+    
 
 client.run(TOKEN)
